@@ -5,20 +5,25 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.preference.PreferenceManager
+import android.view.View
 import android.widget.Button
+import android.widget.EditText
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
+import androidx.cardview.widget.CardView
 import androidx.core.content.res.ResourcesCompat
+import org.osmdroid.bonuspack.location.GeocoderNominatim
 import org.osmdroid.bonuspack.routing.OSRMRoadManager
 import org.osmdroid.bonuspack.routing.Road
 import org.osmdroid.bonuspack.routing.RoadManager
-import org.osmdroid.bonuspack.routing.RoadNode
 import org.osmdroid.config.Configuration
 import org.osmdroid.util.GeoPoint
 import org.osmdroid.views.MapView
 import org.osmdroid.views.overlay.Marker
 import org.osmdroid.views.overlay.Polyline
+import java.util.ArrayList
+import java.util.Locale
 import kotlin.concurrent.thread
 import kotlin.math.*
 
@@ -29,6 +34,10 @@ class MainActivity : AppCompatActivity() {
     private lateinit var tvDistanceToNext: TextView
     private lateinit var tvTotalDistance: TextView
     private lateinit var btnStartNav: Button
+    private lateinit var etStart: EditText
+    private lateinit var etDestination: EditText
+    private lateinit var cardSearch: CardView
+    private lateinit var cardInfo: CardView
 
     private var carMarker: Marker? = null
     private var currentRoad: Road? = null
@@ -41,14 +50,7 @@ class MainActivity : AppCompatActivity() {
 
     // --- Navigation Callbacks ---
     interface NavigationListener {
-        /**
-         * Triggered when a turn/maneuver is completed.
-         */
         fun onTurnDone(instruction: String)
-
-        /**
-         * Updated periodically with navigation progress.
-         */
         fun onProgressUpdate(maneuver: String, distanceToNext: Double, totalRemaining: Double)
     }
 
@@ -80,45 +82,81 @@ class MainActivity : AppCompatActivity() {
         tvDistanceToNext = findViewById(R.id.tvDistanceToNext)
         tvTotalDistance = findViewById(R.id.tvTotalDistance)
         btnStartNav = findViewById(R.id.btnStartNav)
+        etStart = findViewById(R.id.etStart)
+        etDestination = findViewById(R.id.etDestination)
+        cardSearch = findViewById(R.id.cardSearch)
+        cardInfo = findViewById(R.id.cardInfo)
 
         map.setMultiTouchControls(true)
-        val startLocation = GeoPoint(52.3702, 4.8952) // Amsterdam
-        map.controller.setZoom(18.0)
-        map.controller.setCenter(startLocation)
+        val defaultCenter = GeoPoint(51.5074, -0.1278) // London
+        map.controller.setZoom(15.0)
+        map.controller.setCenter(defaultCenter)
 
         btnStartNav.setOnClickListener {
             if (!isSimulating) {
-                startNavigation()
+                val startPlace = etStart.text.toString()
+                val destPlace = etDestination.text.toString()
+
+                if (startPlace.isEmpty() || destPlace.isEmpty()) {
+                    Toast.makeText(this, "Please enter both locations", Toast.LENGTH_SHORT).show()
+                } else {
+                    startNavigation(startPlace, destPlace)
+                }
             } else {
                 stopSimulation()
             }
         }
     }
 
-    private fun startNavigation() {
-        // Define points for simulation (Amsterdam Central to Rijksmuseum)
-        val startPoint = GeoPoint(52.3702, 4.8952) 
-        val endPoint = GeoPoint(52.3600, 4.8852)
-
+    private fun startNavigation(startPlace: String, destPlace: String) {
         thread {
-            val roadManager: RoadManager = OSRMRoadManager(this, packageName)
-            val waypoints = arrayListOf(startPoint, endPoint)
-            val road = roadManager.getRoad(waypoints)
-
-            runOnUiThread {
-                if (road.mStatus == Road.STATUS_OK) {
-                    currentRoad = road
-                    displayRoad(road)
-                    startSimulationLoop(road)
-                } else {
-                    Toast.makeText(this, "Routing error. Check connection.", Toast.LENGTH_LONG).show()
+            try {
+                // Fix: GeocoderNominatim expects (Locale, UserAgent)
+                val geocoder = GeocoderNominatim(Locale.getDefault(), packageName)
+                
+                // Geocode start place
+                val startResults = geocoder.getFromLocationName(startPlace, 1)
+                if (startResults.isNullOrEmpty()) {
+                    runOnUiThread { Toast.makeText(this@MainActivity, "Start location not found", Toast.LENGTH_SHORT).show() }
+                    return@thread
                 }
+                val startPoint = GeoPoint(startResults[0].latitude, startResults[0].longitude)
+
+                // Geocode destination place
+                val destResults = geocoder.getFromLocationName(destPlace, 1)
+                if (destResults.isNullOrEmpty()) {
+                    runOnUiThread { Toast.makeText(this@MainActivity, "Destination location not found", Toast.LENGTH_SHORT).show() }
+                    return@thread
+                }
+                val endPoint = GeoPoint(destResults[0].latitude, destResults[0].longitude)
+
+                // Calculate Road
+                val roadManager = OSRMRoadManager(this@MainActivity, packageName)
+                val waypoints = ArrayList<GeoPoint>()
+                waypoints.add(startPoint)
+                waypoints.add(endPoint)
+                val road = roadManager.getRoad(waypoints)
+
+                runOnUiThread {
+                    if (road.mStatus == Road.STATUS_OK) {
+                        currentRoad = road
+                        displayRoad(road)
+                        startSimulationLoop(road)
+                    } else {
+                        Toast.makeText(this@MainActivity, "Routing error. Check connection.", Toast.LENGTH_LONG).show()
+                    }
+                }
+            } catch (e: Exception) {
+                runOnUiThread { Toast.makeText(this@MainActivity, "Error finding locations: ${e.message}", Toast.LENGTH_LONG).show() }
             }
         }
     }
 
     private fun displayRoad(road: Road) {
-        map.overlays.removeIf { it is Polyline }
+        // Safe way to remove polylines
+        val toRemove = map.overlays.filter { it is Polyline }
+        map.overlays.removeAll(toRemove)
+
         val roadOverlay = RoadManager.buildRoadOverlay(road)
         roadOverlay.outlinePaint.color = Color.parseColor("#3F51B5")
         roadOverlay.outlinePaint.strokeWidth = 12f
@@ -129,12 +167,14 @@ class MainActivity : AppCompatActivity() {
     private fun startSimulationLoop(road: Road) {
         isSimulating = true
         btnStartNav.text = "Stop Simulation"
+        cardSearch.visibility = View.GONE
+        cardInfo.visibility = View.VISIBLE
+        
         currentStepIndex = 0
         nextNodeIndex = 0
         
         if (carMarker == null) {
             carMarker = Marker(map)
-            // Use a built-in compass icon as an arrow placeholder
             carMarker?.setIcon(ResourcesCompat.getDrawable(resources, android.R.drawable.ic_menu_compass, null))
             carMarker?.setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
             carMarker?.setFlat(true)
@@ -201,6 +241,8 @@ class MainActivity : AppCompatActivity() {
         isSimulating = false
         simulationHandler.removeCallbacksAndMessages(null)
         btnStartNav.text = "Start Simulation"
+        cardSearch.visibility = View.VISIBLE
+        cardInfo.visibility = View.GONE
     }
 
     private fun calculateBearing(start: GeoPoint, end: GeoPoint): Float {
