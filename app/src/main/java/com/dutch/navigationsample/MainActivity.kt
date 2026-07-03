@@ -1,0 +1,227 @@
+package com.dutch.navigationsample
+
+import android.graphics.Color
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.preference.PreferenceManager
+import android.widget.Button
+import android.widget.TextView
+import android.widget.Toast
+import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.res.ResourcesCompat
+import org.osmdroid.bonuspack.routing.OSRMRoadManager
+import org.osmdroid.bonuspack.routing.Road
+import org.osmdroid.bonuspack.routing.RoadManager
+import org.osmdroid.bonuspack.routing.RoadNode
+import org.osmdroid.config.Configuration
+import org.osmdroid.util.GeoPoint
+import org.osmdroid.views.MapView
+import org.osmdroid.views.overlay.Marker
+import org.osmdroid.views.overlay.Polyline
+import kotlin.concurrent.thread
+import kotlin.math.*
+
+class MainActivity : AppCompatActivity() {
+
+    private lateinit var map: MapView
+    private lateinit var tvManeuver: TextView
+    private lateinit var tvDistanceToNext: TextView
+    private lateinit var tvTotalDistance: TextView
+    private lateinit var btnStartNav: Button
+
+    private var carMarker: Marker? = null
+    private var currentRoad: Road? = null
+    private val simulationHandler = Handler(Looper.getMainLooper())
+    private var isSimulating = false
+
+    private var currentStepIndex = 0
+    private var nextNodeIndex = 0
+    private val simulationSpeedMs = 200L 
+
+    // --- Navigation Callbacks ---
+    interface NavigationListener {
+        /**
+         * Triggered when a turn/maneuver is completed.
+         */
+        fun onTurnDone(instruction: String)
+
+        /**
+         * Updated periodically with navigation progress.
+         */
+        fun onProgressUpdate(maneuver: String, distanceToNext: Double, totalRemaining: Double)
+    }
+
+    private val navListener = object : NavigationListener {
+        override fun onTurnDone(instruction: String) {
+            runOnUiThread {
+                Toast.makeText(this@MainActivity, "Turn Completed: $instruction", Toast.LENGTH_SHORT).show()
+            }
+        }
+
+        override fun onProgressUpdate(maneuver: String, distanceToNext: Double, totalRemaining: Double) {
+            tvManeuver.text = "Maneuver: $maneuver"
+            tvDistanceToNext.text = "Next turn: ${String.format("%.0f", distanceToNext)} m"
+            tvTotalDistance.text = "Remaining: ${String.format("%.2f", totalRemaining)} km"
+        }
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        
+        // Initialize OSMDroid
+        Configuration.getInstance().load(this, PreferenceManager.getDefaultSharedPreferences(this))
+        Configuration.getInstance().userAgentValue = packageName
+
+        setContentView(R.layout.activity_main)
+
+        map = findViewById(R.id.map)
+        tvManeuver = findViewById(R.id.tvManeuver)
+        tvDistanceToNext = findViewById(R.id.tvDistanceToNext)
+        tvTotalDistance = findViewById(R.id.tvTotalDistance)
+        btnStartNav = findViewById(R.id.btnStartNav)
+
+        map.setMultiTouchControls(true)
+        val startLocation = GeoPoint(52.3702, 4.8952) // Amsterdam
+        map.controller.setZoom(18.0)
+        map.controller.setCenter(startLocation)
+
+        btnStartNav.setOnClickListener {
+            if (!isSimulating) {
+                startNavigation()
+            } else {
+                stopSimulation()
+            }
+        }
+    }
+
+    private fun startNavigation() {
+        // Define points for simulation (Amsterdam Central to Rijksmuseum)
+        val startPoint = GeoPoint(52.3702, 4.8952) 
+        val endPoint = GeoPoint(52.3600, 4.8852)
+
+        thread {
+            val roadManager: RoadManager = OSRMRoadManager(this, packageName)
+            val waypoints = arrayListOf(startPoint, endPoint)
+            val road = roadManager.getRoad(waypoints)
+
+            runOnUiThread {
+                if (road.mStatus == Road.STATUS_OK) {
+                    currentRoad = road
+                    displayRoad(road)
+                    startSimulationLoop(road)
+                } else {
+                    Toast.makeText(this, "Routing error. Check connection.", Toast.LENGTH_LONG).show()
+                }
+            }
+        }
+    }
+
+    private fun displayRoad(road: Road) {
+        map.overlays.removeIf { it is Polyline }
+        val roadOverlay = RoadManager.buildRoadOverlay(road)
+        roadOverlay.outlinePaint.color = Color.parseColor("#3F51B5")
+        roadOverlay.outlinePaint.strokeWidth = 12f
+        map.overlays.add(roadOverlay)
+        map.invalidate()
+    }
+
+    private fun startSimulationLoop(road: Road) {
+        isSimulating = true
+        btnStartNav.text = "Stop Simulation"
+        currentStepIndex = 0
+        nextNodeIndex = 0
+        
+        if (carMarker == null) {
+            carMarker = Marker(map)
+            // Use a built-in compass icon as an arrow placeholder
+            carMarker?.setIcon(ResourcesCompat.getDrawable(resources, android.R.drawable.ic_menu_compass, null))
+            carMarker?.setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
+            carMarker?.setFlat(true)
+            map.overlays.add(carMarker)
+        }
+        
+        simulateNextStep()
+    }
+
+    private fun simulateNextStep() {
+        val road = currentRoad ?: return
+        val points = road.mRouteHigh
+
+        if (currentStepIndex < points.size) {
+            val currentPoint = points[currentStepIndex]
+            
+            // 1. Arrow Rotation (Bearing)
+            if (currentStepIndex < points.size - 1) {
+                val nextPoint = points[currentStepIndex + 1]
+                val bearing = calculateBearing(currentPoint, nextPoint)
+                carMarker?.rotation = -bearing // Counter-clockwise for OSMDroid
+            }
+
+            // 2. Position Arrow and Animate Map
+            carMarker?.position = currentPoint
+            map.controller.animateTo(currentPoint)
+
+            // 3. Process Navigation Callbacks
+            processNavigationProgress(currentPoint, road)
+
+            currentStepIndex++
+            simulationHandler.postDelayed({ simulateNextStep() }, simulationSpeedMs)
+        } else {
+            stopSimulation()
+            Toast.makeText(this, "Destination reached", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun processNavigationProgress(currentPos: GeoPoint, road: Road) {
+        if (nextNodeIndex < road.mNodes.size) {
+            val nextNode = road.mNodes[nextNodeIndex]
+            val distanceToNext = currentPos.distanceToAsDouble(nextNode.mLocation)
+
+            // Calculate overall progress for total remaining distance
+            val progress = currentStepIndex.toDouble() / road.mRouteHigh.size
+            val remainingKm = road.mLength * (1.0 - progress)
+
+            // Trigger Progress Callback
+            navListener.onProgressUpdate(
+                nextNode.mInstructions ?: "Continue", 
+                distanceToNext, 
+                remainingKm
+            )
+
+            // Turn Detection Callback (e.g., within 20 meters of the node)
+            if (distanceToNext < 20.0) {
+                navListener.onTurnDone(nextNode.mInstructions ?: "Maneuver")
+                nextNodeIndex++
+            }
+        }
+    }
+
+    private fun stopSimulation() {
+        isSimulating = false
+        simulationHandler.removeCallbacksAndMessages(null)
+        btnStartNav.text = "Start Simulation"
+    }
+
+    private fun calculateBearing(start: GeoPoint, end: GeoPoint): Float {
+        val lat1 = Math.toRadians(start.latitude)
+        val lon1 = Math.toRadians(start.longitude)
+        val lat2 = Math.toRadians(end.latitude)
+        val lon2 = Math.toRadians(end.longitude)
+        val dLon = lon2 - lon1
+        val y = sin(dLon) * cos(lat2)
+        val x = cos(lat1) * sin(lat2) - sin(lat1) * cos(lat2) * cos(dLon)
+        val bearing = Math.toDegrees(atan2(y, x)).toFloat()
+        return (bearing + 360) % 360
+    }
+
+    override fun onResume() {
+        super.onResume()
+        map.onResume()
+    }
+
+    override fun onPause() {
+        super.onPause()
+        map.onPause()
+    }
+}
