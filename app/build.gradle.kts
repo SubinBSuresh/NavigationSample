@@ -6,7 +6,8 @@ plugins {
 android {
     namespace = "com.dutch.navigationsample"
     compileSdk = 36
-
+// Add this exact line:
+    useLibrary("android.car")
     defaultConfig {
         applicationId = "com.dutch.navigationsample"
         minSdk = 29
