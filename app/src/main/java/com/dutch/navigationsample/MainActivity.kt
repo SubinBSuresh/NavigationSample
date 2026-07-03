@@ -13,6 +13,7 @@ import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.cardview.widget.CardView
 import androidx.core.content.res.ResourcesCompat
+import com.google.android.material.floatingactionbutton.ExtendedFloatingActionButton
 import org.osmdroid.bonuspack.location.GeocoderNominatim
 import org.osmdroid.bonuspack.routing.OSRMRoadManager
 import org.osmdroid.bonuspack.routing.Road
@@ -38,6 +39,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var etDestination: EditText
     private lateinit var cardSearch: CardView
     private lateinit var cardInfo: CardView
+    private lateinit var fabSpeed: ExtendedFloatingActionButton
 
     private var carMarker: Marker? = null
     private var currentRoad: Road? = null
@@ -51,7 +53,7 @@ class MainActivity : AppCompatActivity() {
     // --- Navigation Callbacks ---
     interface NavigationListener {
         fun onTurnDone(instruction: String)
-        fun onProgressUpdate(maneuver: String, distanceToNext: Double, totalRemaining: Double)
+        fun onProgressUpdate(maneuver: String, distanceToNext: Double, totalRemaining: Double, speedKmh: Double)
     }
 
     private val navListener = object : NavigationListener {
@@ -61,10 +63,11 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        override fun onProgressUpdate(maneuver: String, distanceToNext: Double, totalRemaining: Double) {
+        override fun onProgressUpdate(maneuver: String, distanceToNext: Double, totalRemaining: Double, speedKmh: Double) {
             tvManeuver.text = "Maneuver: $maneuver"
             tvDistanceToNext.text = "Next turn: ${String.format("%.0f", distanceToNext)} m"
             tvTotalDistance.text = "Remaining: ${String.format("%.2f", totalRemaining)} km"
+            fabSpeed.text = "${String.format("%.0f", speedKmh)} km/h"
         }
     }
 
@@ -86,9 +89,10 @@ class MainActivity : AppCompatActivity() {
         etDestination = findViewById(R.id.etDestination)
         cardSearch = findViewById(R.id.cardSearch)
         cardInfo = findViewById(R.id.cardInfo)
+        fabSpeed = findViewById(R.id.fabSpeed)
 
         map.setMultiTouchControls(true)
-        val defaultCenter = GeoPoint(51.5074, -0.1278) // London
+        val defaultCenter = GeoPoint(10.0159, 76.3414) // Kakkanad
         map.controller.setZoom(15.0)
         map.controller.setCenter(defaultCenter)
 
@@ -97,8 +101,8 @@ class MainActivity : AppCompatActivity() {
                 val startPlace = etStart.text.toString()
                 val destPlace = etDestination.text.toString()
 
-                if (startPlace.isEmpty() || destPlace.isEmpty()) {
-                    Toast.makeText(this, "Please enter both locations", Toast.LENGTH_SHORT).show()
+                if (destPlace.isEmpty()) {
+                    Toast.makeText(this, "Please enter a destination", Toast.LENGTH_SHORT).show()
                 } else {
                     startNavigation(startPlace, destPlace)
                 }
@@ -111,16 +115,19 @@ class MainActivity : AppCompatActivity() {
     private fun startNavigation(startPlace: String, destPlace: String) {
         thread {
             try {
-                // Fix: GeocoderNominatim expects (Locale, UserAgent)
                 val geocoder = GeocoderNominatim(Locale.getDefault(), packageName)
                 
-                // Geocode start place
-                val startResults = geocoder.getFromLocationName(startPlace, 1)
-                if (startResults.isNullOrEmpty()) {
-                    runOnUiThread { Toast.makeText(this@MainActivity, "Start location not found", Toast.LENGTH_SHORT).show() }
-                    return@thread
+                // Geocode start place or use default Kakkanad
+                val startPoint = if (startPlace.isBlank()) {
+                    GeoPoint(10.0159, 76.3414) // Kakkanad, Kochi
+                } else {
+                    val startResults = geocoder.getFromLocationName(startPlace, 1)
+                    if (startResults.isNullOrEmpty()) {
+                        runOnUiThread { Toast.makeText(this@MainActivity, "Start location not found", Toast.LENGTH_SHORT).show() }
+                        return@thread
+                    }
+                    GeoPoint(startResults[0].latitude, startResults[0].longitude)
                 }
-                val startPoint = GeoPoint(startResults[0].latitude, startResults[0].longitude)
 
                 // Geocode destination place
                 val destResults = geocoder.getFromLocationName(destPlace, 1)
@@ -153,7 +160,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun displayRoad(road: Road) {
-        // Safe way to remove polylines
         val toRemove = map.overlays.filter { it is Polyline }
         map.overlays.removeAll(toRemove)
 
@@ -169,6 +175,7 @@ class MainActivity : AppCompatActivity() {
         btnStartNav.text = "Stop Simulation"
         cardSearch.visibility = View.GONE
         cardInfo.visibility = View.VISIBLE
+        fabSpeed.visibility = View.VISIBLE
         
         currentStepIndex = 0
         nextNodeIndex = 0
@@ -190,7 +197,16 @@ class MainActivity : AppCompatActivity() {
 
         if (currentStepIndex < points.size) {
             val currentPoint = points[currentStepIndex]
+            var speedKmh = 0.0
             
+            // Calculate speed
+            if (currentStepIndex > 0) {
+                val prevPoint = points[currentStepIndex - 1]
+                val distanceMeters = currentPoint.distanceToAsDouble(prevPoint)
+                // Speed = distance (m) / time (ms) -> convert to km/h
+                speedKmh = (distanceMeters * 3600.0) / simulationSpeedMs
+            }
+
             // 1. Arrow Rotation (Bearing)
             if (currentStepIndex < points.size - 1) {
                 val nextPoint = points[currentStepIndex + 1]
@@ -203,7 +219,7 @@ class MainActivity : AppCompatActivity() {
             map.controller.animateTo(currentPoint)
 
             // 3. Process Navigation Callbacks
-            processNavigationProgress(currentPoint, road)
+            processNavigationProgress(currentPoint, road, speedKmh)
 
             currentStepIndex++
             simulationHandler.postDelayed({ simulateNextStep() }, simulationSpeedMs)
@@ -213,7 +229,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun processNavigationProgress(currentPos: GeoPoint, road: Road) {
+    private fun processNavigationProgress(currentPos: GeoPoint, road: Road, speedKmh: Double) {
         if (nextNodeIndex < road.mNodes.size) {
             val nextNode = road.mNodes[nextNodeIndex]
             val distanceToNext = currentPos.distanceToAsDouble(nextNode.mLocation)
@@ -226,7 +242,8 @@ class MainActivity : AppCompatActivity() {
             navListener.onProgressUpdate(
                 nextNode.mInstructions ?: "Continue", 
                 distanceToNext, 
-                remainingKm
+                remainingKm,
+                speedKmh
             )
 
             // Turn Detection Callback (e.g., within 20 meters of the node)
@@ -243,6 +260,7 @@ class MainActivity : AppCompatActivity() {
         btnStartNav.text = "Start Simulation"
         cardSearch.visibility = View.VISIBLE
         cardInfo.visibility = View.GONE
+        fabSpeed.visibility = View.GONE
     }
 
     private fun calculateBearing(start: GeoPoint, end: GeoPoint): Float {
